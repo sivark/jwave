@@ -36,6 +36,8 @@ from jwave.geometry import (
 )
 from jwave.signal_processing import smooth
 from jwave.transformations import CheckpointType, ScanCheckpoint
+from diffrax import SemiImplicitEulerCorrected, diffeqsolve, SaveAt, ODETerm
+from jax.lax import scan
 
 from .pml import td_pml_on_grid
 
@@ -429,7 +431,7 @@ def simulate_wave_propagation(
         return [p, u, rho], sensors(p, u, rho)
 
     # Define the scanning function according to the checkpoint type
-    scan = ScanCheckpoint(checkpoint, max_unroll_checkpoint)
+    #scan = ScanCheckpoint(checkpoint, max_unroll_checkpoint)
 
     _, ys = scan(scan_fun, fields, output_steps)
 
@@ -568,34 +570,62 @@ def simulate_wave_propagation(
     rho = rho / (medium.sound_speed**2)
 
     # define functions to integrate
-    fields = [p0, u0, rho]
-
-    def scan_fun(fields, n):
-        p, u, rho = fields
+    fields = (u0, rho)
+    
+    # Need to define 3 functions: momc, massc, sampling
+    def sampling(t, fields, args):
+        u, rho = fields
+        
+        # Generate p
+        p = pressure_from_density(rho, medium)
+        
+        return sensors(p, u, rho)
+    
+    def f(t, rho, args):
+        
+        # Generate p
+        p = pressure_from_density(rho, medium)
+        
+        return momentum_conservation_rhs(
+            p, rho, medium, c_ref=c_ref, dt=dt, params=params["fourier"]
+        )
+        
+    def g(t, u, args):
+        
+        # Generate (a fake) p
+        p = pressure_from_density(u, medium)
+        
+        # Generate source field if needed
+        n = jnp.round(t * dt)
+        
         if sources is None:
             mass_src_field = 0.0
         else:
             mass_src_field = sources.on_grid(n)
-
-        du = momentum_conservation_rhs(
-            p, u, medium, c_ref=c_ref, dt=dt, params=params["fourier"]
-        )
-        u = pml_u * (pml_u * u + dt * du)
-
-        drho = mass_conservation_rhs(
+        
+        return mass_conservation_rhs(
             p, u, mass_src_field, medium, c_ref=c_ref, dt=dt, params=params["fourier"]
         )
-        rho = pml_rho * (pml_rho * rho + dt * drho)
+    
+    saveat = SaveAt(fn=sampling, steps=True)
+    terms = ODETerm(f), ODETerm(g)
+    state = fields
+    solver = SemiImplicitEulerCorrected()
+    args = (pml_u, pml_rho, None)
+    
+    solution = diffeqsolve(
+        terms, 
+        solver,
+        t0 = 0,
+        t1 = time_axis.t_end,
+        dt0 = time_axis.dt,
+        y0 = state,
+        saveat=saveat,
+        args=args,
+        max_steps=int(time_axis.Nt)
+    )
 
-        p = pressure_from_density(rho, medium)
-        return [p, u, rho], sensors(p, u, rho)
-
-    # Define the scanning function according to the checkpoint type
-    scan = ScanCheckpoint(checkpoint, max_unroll_checkpoint)
-
-    _, ys = scan(scan_fun, fields, output_steps)
-
-    return ys
+    return solution.ys
 
 
 if __name__ == "__main__":
