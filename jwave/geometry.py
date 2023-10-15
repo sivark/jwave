@@ -345,7 +345,7 @@ class Sources:
 
         idx = n.astype(jnp.int32)
         signals = self.signals[:, idx]
-        src = src.at[self.positions].add(signals)
+        src = src.at[tuple(self.positions)].add(signals)
         return jnp.expand_dims(src, -1)
 
     @staticmethod
